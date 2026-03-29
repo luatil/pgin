@@ -18,12 +18,13 @@ pgin [OPTIONS] <file>
 
 | Flag | Description |
 |---|---|
-| `-p, --page <N>` | Inspect a single page by index (default: all pages) |
-| `-r, --range <N-M>` | Inspect a range of pages |
+| `-p, --page <N>` | Inspect a single page by index (default: all pages); exit 1 if N is out of range |
+| `-r, --range <N-M>` | Inspect a range of pages (zero-indexed, inclusive on both ends; clamps to available pages) |
 | `-i, --items` | Show line pointer array and tuple data |
 | `-x, --hex` | Show raw hex dump of each page alongside parsed output |
 | `--page-size <N>` | Override page size (default: 8192) |
 | `-f, --format <fmt>` | Output format: `text` (default), `json` |
+| `--verify-checksums` | Verify page checksums (only meaningful if `pd_checksum != 0`) |
 
 ## Output
 
@@ -57,9 +58,35 @@ Page 0  (offset 0x000000)
 
   lp[0]  offset=2952  length=72  state=NORMAL
   lp[1]  offset=2880  length=72  state=NORMAL
-  lp[2]  offset=2808  length=72  state=NORMAL  (dead)
+  lp[2]  offset=2808  length=72  state=DEAD
   lp[3]  offset=0     length=0   state=UNUSED
+  lp[4]  offset=8     length=0   state=REDIRECT  redirect_to=2
 ```
+
+### With `-f json`
+
+```json
+[
+  {
+    "page": 0,
+    "offset": "0x000000",
+    "lsn": "0/18E4A10",
+    "checksum": 0,
+    "flags": 0,
+    "lower": 64,
+    "upper": 2816,
+    "special": 8192,
+    "page_version": 4,
+    "prune_xid": 0,
+    "free_space": 2752,
+    "line_pointers": [
+      { "index": 0, "offset": 2952, "length": 72, "state": "NORMAL" }
+    ]
+  }
+]
+```
+
+Line pointers are only included when `--items` is also passed. `"offset"` is always a hex string; all other numeric fields are JSON numbers. For REDIRECT entries, `"redirect_to"` holds the target line pointer index (the value stored in `lp_off`).
 
 ### With `--hex`
 
@@ -68,7 +95,7 @@ with byte ranges annotated per field:
 
 ```
 Page 0  (offset 0x000000)
-  [0x00..0x07]  pd_lsn:      10 A1 E4 18 00 00 00 00   LSN: 0/18E4A10
+  [0x00..0x07]  pd_lsn:      00 00 00 00 10 4A 8E 01   LSN: 0/18E4A10
   [0x08..0x09]  pd_checksum: 00 00
   [0x0A..0x0B]  pd_flags:    00 00
   [0x0C..0x0D]  pd_lower:    40 00                     64
@@ -82,9 +109,16 @@ Page 0  (offset 0x000000)
 
 ```rust
 // Mirrors PageHeaderData from postgres/src/include/storage/bufpage.h
+//
+// pd_lsn is stored on disk as a u64 with the two 32-bit halves swapped
+// relative to the logical LSN value (on little-endian, the high word is
+// at byte offset 0 and the low word at offset 4).  To recover the LSN:
+//   logical_lsn = (stored_u64 << 32) | (stored_u64 >> 32)
+// Displayed as "high/low" in hex, e.g. "0/18E4A10".
+
 #[repr(C)]
 struct PageHeader {
-    pd_lsn:               PageXLogRecPtr,  // u64 (hi: u32, lo: u32)
+    pd_lsn:               u64,              // 8 bytes — word-swapped LSN
     pd_checksum:          u16,
     pd_flags:             u16,
     pd_lower:             u16,             // LocationIndex
@@ -93,12 +127,13 @@ struct PageHeader {
     pd_pagesize_version:  u16,
     pd_prune_xid:         u32,             // TransactionId
     // followed by pd_linp[]: ItemIdData[]
+    // total header size: 24 bytes
 }
 
-// ItemIdData: 32-bit packed field
-// bits 0..1:   lp_flags  (UNUSED=0, NORMAL=1, REDIRECT=2, DEAD=3)
-// bits 2..14:  lp_len    (byte length of tuple)
-// bits 15..31: lp_off    (byte offset from page start)
+// ItemIdData: 32-bit packed bitfield (little-endian, LSB-first)
+// bits  0..=14:  lp_off    (15 bits — byte offset from page start)
+// bits 15..=16:  lp_flags  (2 bits: UNUSED=0, NORMAL=1, REDIRECT=2, DEAD=3)
+// bits 17..=31:  lp_len    (15 bits — byte length of tuple)
 struct ItemId(u32);
 ```
 
@@ -106,16 +141,16 @@ struct ItemId(u32);
 
 1. Open file, determine size → number of pages (`size / page_size`)
 2. For each selected page, read exactly `page_size` bytes into a `[u8; 8192]`
-3. Parse `PageHeader` from the first 24 bytes using `bytemuck` or manual `u16::from_le_bytes`
+3. Parse `PageHeader` from the first 24 bytes using manual `u16::from_le_bytes` / `u32::from_le_bytes`, or `bytemuck::pod_read_unaligned` (do not cast a `[u8]` slice directly — the buffer may not satisfy `PageHeader`'s alignment requirements)
 4. Derive number of line pointers: `(pd_lower - size_of::<PageHeader>()) / 4`
 5. Parse each `ItemId` (4 bytes, packed bitfield)
-6. If `--items`: walk to `lp_off` within the page and print raw tuple bytes (no heap tuple decoding in v1)
+6. If `--items`: decode each `ItemId` and display its `lp_off`, `lp_len`, and `lp_flags` fields in the structured format shown above; for REDIRECT entries, label the offset field `redirect_to` since `lp_off` holds the target lp index rather than a byte offset (no heap tuple decoding in v1 — tuple bytes at `lp_off` are not printed)
 
 ## Error handling
 
 - File not found or not readable → exit 1 with message
-- File size not a multiple of `page_size` → warn, process complete pages only
-- `pd_pagesize_version` page size bits disagree with `--page-size` → warn per page
+- File size not a multiple of `page_size` → warn to stderr, process complete pages only, exit 0
+- `pd_pagesize_version` page size bits disagree with `--page-size` → warn to stderr per page, continue, exit 0
 - Checksum validation: if `pd_checksum != 0`, compute and compare (optional flag `--verify-checksums`)
 
 ## Phases / scope
